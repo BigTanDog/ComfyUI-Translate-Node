@@ -1,0 +1,94 @@
+# ComfyUI AI 翻译节点 🌐
+
+一个内置 AI 翻译能力的 ComfyUI 自定义节点。双语文本框设计：左侧待翻译、右侧译文，**自动识别语言方向**——非中文一律译为简体中文，中文则译为英文。
+
+支持模型：
+
+| 模型 | 提供方 | 接入端点 | 模型 ID |
+|---|---|---|---|
+| DeepSeek-V4-Flash | [DeepSeek 开放平台](https://platform.deepseek.com/api_keys) | `https://api.deepseek.com` | `deepseek-v4-flash` |
+| GLM-5.3-Flash | [智谱 BigModel](https://open.bigmodel.cn) | `https://open.bigmodel.cn/api/paas/v4` | `glm-5.3-flash` |
+
+## ✨ 功能特性
+
+- **左右对称双栏界面**：输入框 / 译文框分列两侧，中间竖排操作按钮，宽度均分、随节点拖拽等比缩放
+- **高度自适应**：文本框初始固定高度（150px），内容变长时双框等高撑开（上限 600px 后框内滚动），清空自动回落
+- **一键翻译**：点击按钮调用 AI 翻译，按钮实时显示「翻译中…」状态，错误信息（未填密钥 / API 报错 / 网络失败）直接显示在状态栏
+- **互换按钮**：⇅ 一键将译文换到左侧输入框、原文换到右侧，方便基于译文继续迭代；右侧无译文时自动灰禁
+- **复制译文**：一键复制到剪贴板（文本框本身也支持框选复制粘贴）
+- **模型切换**：点 ⚙️ 打开设置面板，顶部实时显示当前模型，DS / GLM 一键切换，API 密钥按模型分开保存
+- **接口联动**：左侧 `text` 输入接口可接入上游节点（如 WD14 Tagger 等本地反推插件），执行队列后文本自动落入待翻译框
+- **内容持久化**：两个文本框的内容保存在节点属性中，工作流保存 / 重开不丢失
+
+## 📦 安装
+
+克隆到 ComfyUI 的 `custom_nodes` 目录：
+
+```bash
+cd ComfyUI/custom_nodes
+git clone https://github.com/BigTanDog/ComfyUI-Translate-Node.git
+```
+
+或手动下载后把整个 `ComfyUI-Translate-Node` 文件夹放入 `custom_nodes`。重启 ComfyUI，节点位于菜单 **文本处理 → AI 翻译 🌐**（右键画布搜索「AI 翻译」）。
+
+## 🚀 快速开始
+
+1. 添加「AI 翻译 🌐」节点
+2. 点节点上的 **⚙️** 按钮：
+   - 选择模型（DS / GLM）
+   - 填入对应平台的 API 密钥 → 点「确认」
+3. 在左侧框粘贴文本，点 **翻译** → 译文出现在右侧框
+4. 需要「拿译文当新原文」时点 **⇅ 互换**
+
+## 🔌 接入上游节点（如本地反推）
+
+节点左侧的 `text` 输入接口可接收上游 STRING 输出：
+
+```
+反推插件（WD14 Tagger 等）→ text 输出 → Reroute → 翻译节点 text 输入
+```
+
+运行一次队列（Queue）后，上游文本会**自动回填到左侧待翻译框**，再点翻译即可。
+
+> 说明：受 ComfyUI 机制限制，socket 值仅在队列执行时传递；节点已标记为 `OUTPUT_NODE` 以保证参与执行。空文本不会覆盖框内已有内容。
+
+右侧 `text` 输出接口当前为直通（下游可拿到收到的文本），更多能力规划中。
+
+## 🏗️ 工作原理
+
+```
+[前端 UI] --POST /ctn/translate--> [ComfyUI 后端路由] --> DeepSeek / GLM API
+    ↑                                                        |
+    └────────────── 译文 JSON 返回，写入右侧文本框 <──────────┘
+```
+
+- 翻译请求由**后端路由转发**调用 AI API，无浏览器 CORS 问题
+- API 密钥保存在浏览器 `localStorage`（按模型分开），随请求传给后端转发，**不落盘**
+- 每个节点的模型选择存在节点 `properties` 中，可同屏放多个节点使用不同模型
+- 语言方向识别交给 AI 完成（system prompt 约定），无需本地判断
+
+## ⚠️ 兼容性说明
+
+针对新版 ComfyUI 前端（Vue 渲染器，frontend 1.4x+）实测踩过的两个坑，供其他插件开发者参考：
+
+1. **`addDOMWidget` 的 type 参数必须是非空字符串**。新版前端用 `!!widget.type` 过滤 DOM widget，传空字符串 `""` 会导致整个 UI 静默不渲染（节点空白、无报错）。旧版 canvas 前端无此限制，网上大量旧示例代码会踩坑。
+2. **DOM widget 建议显式设置 `computeSize`**，不要依赖浏览器测量（元素未挂载时量到的高度为 0）。
+
+## 📁 文件结构
+
+```
+ComfyUI-Translate-Node/
+├── __init__.py          # 插件入口：注册节点 + web 目录
+├── translator_node.py   # 节点定义（OUTPUT_NODE）+ /ctn/translate 翻译路由
+└── web/js/
+    └── translate_ui.js  # 前端界面：双栏文本框 / 翻译 / 互换 / 设置弹窗
+```
+
+## 📌 已知限制
+
+- 翻译按钮为实时 HTTP 请求，不经过 ComfyUI 队列排队；输出接口暂为直通占位
+- 上游文本需执行队列后才会回填（ComfyUI 机制），实时取值暂不支持
+
+## 📄 License
+
+MIT
