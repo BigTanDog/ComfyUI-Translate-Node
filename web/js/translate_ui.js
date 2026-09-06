@@ -74,6 +74,33 @@ const HEADER_H = 80;   // 节点标题 + 输入输出接口区高度
 .ctn-swap:hover:not(:disabled) { filter:brightness(1.15); }
 .ctn-swap:disabled { background:#2a2a2a; color:#666; cursor:not-allowed; }
 .ctn-swap svg { flex:0 0 auto; }
+.ctn-sendbtn {
+  height:28px; width:100%; padding:0; border:none; border-radius:6px; cursor:pointer;
+  display:flex; align-items:center; justify-content:center; gap:4px;
+  background:#b8770e; color:#fff; font-size:12px;
+}
+.ctn-sendbtn:hover:not(:disabled) { filter:brightness(1.15); }
+.ctn-sendbtn:disabled { background:#2a2a2a; color:#666; cursor:not-allowed; }
+.ctn-sendbtn svg { flex:0 0 auto; }
+
+/* 发送目标选择弹窗（多透传节点时） */
+#ctn-send-overlay {
+  position:fixed; inset:0; z-index:99999; background:rgba(0,0,0,.55);
+  display:flex; align-items:center; justify-content:center;
+}
+.ctn-send-panel {
+  width:320px; background:var(--comfy-menu-bg, #1e1e1e); color:var(--input-text, #ddd);
+  border:1px solid var(--border-color, #444); border-radius:10px;
+  padding:14px; display:flex; flex-direction:column; gap:8px;
+  box-shadow:0 8px 32px rgba(0,0,0,.5);
+}
+.ctn-send-panel .ctn-title { font-size:14px; font-weight:600; text-align:center; }
+.ctn-send-item {
+  padding:8px 10px; border:1px solid var(--border-color, #444); border-radius:6px;
+  cursor:pointer; font-size:13px; background:#2c2c2c; color:var(--input-text, #ddd);
+  text-align:left; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+}
+.ctn-send-item:hover { background:#3a3a3a; border-color:#b8770e; }
 .ctn-status { font-size:11px; min-height:14px; line-height:14px; color:#888; }
 .ctn-status.err { color:#e05656; }
 .ctn-status.ok { color:#4fc06a; }
@@ -193,6 +220,9 @@ function buildUI(node) {
         <button class="ctn-swap ctn-swapbtn" title="把右侧译文换到左侧输入框（两边内容互换）" disabled>
           <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 20V6"/><path d="M3 10l4-4 4 4"/><path d="M17 4v14"/><path d="M13 14l4 4 4-4"/></svg>互换
         </button>
+        <button class="ctn-sendbtn" title="把右侧译文发送到「文本（透传）」节点（保留其提示词段）" disabled>
+          <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12h14"/><path d="M12 6l6 6-6 6"/></svg>发送
+        </button>
       </div>
       <textarea class="ctn-output" placeholder="翻译结果" readonly></textarea>
     </div>
@@ -204,6 +234,7 @@ function buildUI(node) {
   const statusEl = el.querySelector(".ctn-status");
   const copyBtn = el.querySelector(".ctn-copy");
   const swapBtn = el.querySelector(".ctn-swapbtn");
+  const sendBtn = el.querySelector(".ctn-sendbtn");
   const clearBtn = el.querySelector(".ctn-clear");
 
   // 挂到节点上，供 onConfigure 加载工作流时回填
@@ -246,9 +277,11 @@ function buildUI(node) {
     sync();
   });
 
-  // 互换按钮状态：右侧（译文）为空时灰禁
+  // 互换/发送按钮状态：右侧（译文）为空时灰禁
   const updateSwapState = () => {
-    swapBtn.disabled = !outputEl.value.trim();
+    const has = !!outputEl.value.trim();
+    swapBtn.disabled = !has;
+    sendBtn.disabled = !has;
   };
   node.ctn.updateSwap = updateSwapState;
 
@@ -344,6 +377,79 @@ function buildUI(node) {
 
   // 齿轮 → 设置弹窗
   el.querySelector(".ctn-gear").addEventListener("click", () => openSettings(node));
+
+  // ── 发送：译文 → 「文本（透传）」节点（保留其提示词段）──
+  function sendToTarget(ptNode, translation) {
+    // 模式检查：Use Input 模式下写入的 prompt_text 不会被下游使用
+    const uw = ptNode.widgets?.find((w) => w.name === "use_input_text");
+    if (uw && uw.value) {
+      statusEl.textContent = "透传节点处于 📥 输入 模式，请先在其工具栏点 📝 内容 再发送";
+      statusEl.className = "ctn-status err";
+      return;
+    }
+    // 找到插件标签编辑器的 textarea（数据源），排除中文转 tag 的 chipInput
+    const uiw = ptNode.widgets?.find((w) => w.name === "db_pt_ui");
+    const tas = (uiw?.element || ptNode.widgets?.find((w) => w.element?.querySelector?.("textarea"))?.element || {}).querySelectorAll?.("textarea") || [];
+    let ta = null;
+    tas.forEach((t) => { if (!ta && !(t.placeholder || "").includes("英文tag")) ta = t; });
+    if (!ta) {
+      statusEl.textContent = "未找到透传节点的编辑器，插件版本可能不兼容";
+      statusEl.className = "ctn-status err";
+      return;
+    }
+    // 契约组装：第 1 段(提示词)保留，其余段替换为译文；无分段(单段)则追加
+    const segs = ta.value.split(/\n\s*\n/).map((s) => s.trim()).filter(Boolean);
+    let next, note;
+    if (segs.length === 0) { next = translation; note = "目标为空，已写入译文"; }
+    else if (segs.length === 1) { next = segs[0] + "\n\n" + translation; note = "未检测到分段，已追加"; }
+    else { next = segs[0] + "\n\n" + translation; note = "已发送，提示词段已保留"; }
+    // 只改编辑器数据源，派发 input 让插件自己的 syncWidget 完成全部回写
+    ta.value = next;
+    ta.dispatchEvent(new Event("input", { bubbles: true }));
+    statusEl.textContent = "✓ " + note;
+    statusEl.className = "ctn-status ok";
+  }
+
+  // 多目标时弹窗选择
+  function openSendPicker(targets, translation) {
+    const ov = document.createElement("div");
+    ov.id = "ctn-send-overlay";
+    const panel = document.createElement("div");
+    panel.className = "ctn-send-panel";
+    panel.innerHTML = `<div class="ctn-title">选择要发送到的透传节点</div>`;
+    targets.forEach((t) => {
+      const b = document.createElement("button");
+      b.className = "ctn-send-item";
+      b.textContent = (t.title || "文本（透传）") + "  #" + t.id;
+      b.addEventListener("click", () => { ov.remove(); sendToTarget(t, translation); });
+      panel.appendChild(b);
+    });
+    const cancel = document.createElement("button");
+    cancel.className = "ctn-send-item";
+    cancel.textContent = "取消";
+    cancel.style.textAlign = "center";
+    cancel.addEventListener("click", () => ov.remove());
+    panel.appendChild(cancel);
+    ov.appendChild(panel);
+    document.body.appendChild(ov);
+    ov.addEventListener("click", (e) => { if (e.target === ov) ov.remove(); });
+  }
+
+  sendBtn.addEventListener("click", () => {
+    if (sendBtn.disabled) return;
+    const translation = outputEl.value.trim();
+    if (!translation) return;
+    const graph = app.graph;
+    const all = graph?._nodes || graph?.nodes || [];
+    const targets = all.filter((n) => n.type === "DanbooruTextPassthrough");
+    if (!targets.length) {
+      statusEl.textContent = "画布上没有「文本（透传）」节点";
+      statusEl.className = "ctn-status err";
+      return;
+    }
+    if (targets.length === 1) sendToTarget(targets[0], translation);
+    else openSendPicker(targets, translation);
+  });
 
   // 初始尺寸：宽度固定起步，高度 = 头部 + 初始框高 + 状态栏
   if (node.size[0] < NODE_W) node.size[0] = NODE_W;
