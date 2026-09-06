@@ -29,6 +29,16 @@ const HEADER_H = 80;   // 节点标题 + 输入输出接口区高度
   padding:4px 6px 8px; box-sizing:border-box; width:100%;
 }
 .ctn-boxes { display:flex; gap:8px; align-items:stretch; }
+.ctn-input-wrap { flex:1 1 0; min-width:0; position:relative; display:flex; }
+.ctn-clear {
+  position:absolute; right:8px; bottom:8px; width:22px; height:22px;
+  border:none; border-radius:50%; cursor:pointer;
+  background:#e05656; color:#fff; font-size:12px; line-height:1;
+  display:flex; align-items:center; justify-content:center; opacity:.7;
+  transition:opacity .15s;
+}
+.ctn-clear:hover { opacity:1; }
+.ctn-clear.ctn-hide { display:none; }
 .ctn-ui textarea {
   display:block; flex:1 1 0; min-width:0; box-sizing:border-box; resize:none;
   height:${BOX_MIN_H}px; overflow-y:auto;
@@ -170,7 +180,10 @@ function buildUI(node) {
   el.className = "ctn-ui";
   el.innerHTML = `
     <div class="ctn-boxes">
-      <textarea class="ctn-input" placeholder="输入原文（自动识别语言：非中文→译为中文，中文→译为英文）"></textarea>
+      <div class="ctn-input-wrap">
+        <textarea class="ctn-input" placeholder="输入原文（自动识别语言：非中文→译为中文，中文→译为英文）"></textarea>
+        <button class="ctn-clear ctn-hide" title="清空左侧文本">✕</button>
+      </div>
       <div class="ctn-mid">
         <button class="ctn-btn ctn-go">翻译</button>
         <div class="ctn-mid-row">
@@ -191,6 +204,7 @@ function buildUI(node) {
   const statusEl = el.querySelector(".ctn-status");
   const copyBtn = el.querySelector(".ctn-copy");
   const swapBtn = el.querySelector(".ctn-swapbtn");
+  const clearBtn = el.querySelector(".ctn-clear");
 
   // 挂到节点上，供 onConfigure 加载工作流时回填
   node.ctn = { inputEl, outputEl, sync: null, updateSwap: null };
@@ -220,8 +234,17 @@ function buildUI(node) {
       node.size[1] = total;
       node.setDirtyCanvas?.(true, true);
     }
+    // 清空按钮：左框有内容才显示（所有内容变动都会经过 sync，一处联动全覆盖）
+    clearBtn.classList.toggle("ctn-hide", !inputEl.value);
   };
   node.ctn.sync = sync;
+
+  // 一键清空左侧文本
+  clearBtn.addEventListener("click", () => {
+    inputEl.value = "";
+    node.properties.ctn_input = "";
+    sync();
+  });
 
   // 互换按钮状态：右侧（译文）为空时灰禁
   const updateSwapState = () => {
