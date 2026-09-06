@@ -397,12 +397,15 @@ function buildUI(node) {
       statusEl.className = "ctn-status err";
       return;
     }
-    // 契约组装：第 1 段(提示词)保留，其余段替换为译文；无分段(单段)则追加
-    const segs = ta.value.split(/\n\s*\n/).map((s) => s.trim()).filter(Boolean);
+    // 契约（单换行制）：第 1 行 = 提示词行，保留；第 2 行起 = 内容行，整体替换为译文。
+    // 与上游（反推工作流）回传的天然形态一致："提示词 + 单换行 + 句子"。
+    // 目标只有 1 行（无内容行）→ 追加；目标为空 → 直接写入译文。
+    const lines = ta.value.replace(/^\s+|\s+$/g, "").split("\n");
+    const first = lines[0] || "";
     let next, note;
-    if (segs.length === 0) { next = translation; note = "目标为空，已写入译文"; }
-    else if (segs.length === 1) { next = segs[0] + "\n\n" + translation; note = "未检测到分段，已追加"; }
-    else { next = segs[0] + "\n\n" + translation; note = "已发送，提示词段已保留"; }
+    if (!first.trim()) { next = translation; note = "目标为空，已写入译文"; }
+    else if (lines.length === 1) { next = first + "\n" + translation; note = "未检测到内容行，已追加"; }
+    else { next = first + "\n" + translation; note = "已发送，提示词行已保留"; }
     // 只改编辑器数据源，派发 input 让插件自己的 syncWidget 完成全部回写
     ta.value = next;
     ta.dispatchEvent(new Event("input", { bubbles: true }));
