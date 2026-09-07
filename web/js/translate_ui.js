@@ -157,6 +157,10 @@ function openSettings(node) {
         <button data-m="deepseek" class="${selected === "deepseek" ? "ctn-active" : ""}">DeepSeek-V4-Flash</button>
         <button data-m="glm" class="${selected === "glm" ? "ctn-active" : ""}">GLM-5.3-Flash</button>
       </div>
+      <div class="ctn-line ctn-line-row" style="display:flex; align-items:center; justify-content:space-between;">
+        <span>接收上游文本（text 输入）</span>
+        <button id="ctn-accept" class="${node.properties.ctn_accept_input === false ? "" : "ctn-active"}" style="flex:0 0 60px;">${node.properties.ctn_accept_input === false ? "关闭" : "开启"}</button>
+      </div>
       <div class="ctn-line">API 密钥（<span id="ctn-key-label">${MODEL_INFO[selected].label}</span>）：</div>
       <input id="ctn-key" type="password" placeholder="sk-..." autocomplete="off">
       <div class="ctn-row">
@@ -170,6 +174,15 @@ function openSettings(node) {
   const curLabel = overlay.querySelector("#ctn-cur");
   const keyLabel = overlay.querySelector("#ctn-key-label");
   keyInput.value = localStorage.getItem(MODEL_INFO[selected].keyStorage) || "";
+
+  // 接收上游文本开关（关闭 = 相当于断开 text 输入接口，queue 时不会拉起上游）
+  let acceptInput = node.properties.ctn_accept_input !== false;
+  const acceptBtn = overlay.querySelector("#ctn-accept");
+  const renderAccept = () => {
+    acceptBtn.textContent = acceptInput ? "开启" : "关闭";
+    acceptBtn.classList.toggle("ctn-active", acceptInput);
+  };
+  acceptBtn.addEventListener("click", () => { acceptInput = !acceptInput; renderAccept(); });
 
   // 切换模型：高亮 + 同步显示对应模型的已存密钥
   overlay.querySelectorAll("button[data-m]").forEach((btn) => {
@@ -197,6 +210,7 @@ function openSettings(node) {
   overlay.querySelector("#ctn-ok").addEventListener("click", () => {
     localStorage.setItem(MODEL_INFO[selected].keyStorage, keyInput.value.trim());
     node.properties.translate_model = selected;
+    node.properties.ctn_accept_input = acceptInput;
     close();
   });
 }
@@ -460,6 +474,42 @@ function buildUI(node) {
   if (node.size[1] < minTotal) node.size[1] = minTotal;
 }
 
+// ---------------- queue 前输入断开（方案 A + 手动开关）----------------
+function ctnDetachInputLinksIfNeeded() {
+  try {
+    const nodes = app.graph?._nodes || app.graph?.nodes || [];
+    const tnNodes = nodes.filter((n) => n.type === "ComfyTranslateNode");
+    if (!tnNodes.length) return () => {};
+    const ptNodes = nodes.filter((n) => n.type === "DanbooruTextPassthrough");
+    const anyContent = ptNodes.some((p) => {
+      const uw = p.widgets?.find((w) => w.name === "use_input_text");
+      return uw ? uw.value === false : false;
+    });
+    const needDetach =
+      tnNodes.some((n) => n.properties.ctn_accept_input === false) || anyContent;
+    if (!needDetach) return () => {};
+    const saved = [];
+    tnNodes.forEach((n) => {
+      (n.inputs || []).forEach((inp, i) => {
+        if (inp.name === "text" && inp.link != null) {
+          saved.push({ node: n, slot: i, link: inp.link });
+          inp.link = null; // 临时断开：提交的执行图里不再依赖上游
+        }
+      });
+    });
+    if (!saved.length) return () => {};
+    return () => {
+      saved.forEach((s2) => {
+        try { s2.node.inputs[s2.slot].link = s2.link; } catch (e) {}
+      });
+      app.canvas?.setDirty?.(true, true);
+    };
+  } catch (e) {
+    console.error("[TranslateNode] detach failed:", e);
+    return () => {};
+  }
+}
+
 // ---------------- 扩展注册 ----------------
 app.registerExtension({
   name: "ComfyUI.TranslateNode",
@@ -471,6 +521,7 @@ app.registerExtension({
       const r = onNodeCreated?.apply(this, arguments);
       try {
         if (!this.properties.translate_model) this.properties.translate_model = "deepseek";
+        if (this.properties.ctn_accept_input === undefined) this.properties.ctn_accept_input = true;
         buildUI(this);
       } catch (e) {
         console.error("[TranslateNode] UI 构建失败:", e);
@@ -507,6 +558,24 @@ app.registerExtension({
         ui.updateSwap?.();
       }
       return r;
+    };
+  },
+
+  // ── queue 前动态断开 text 输入（方案 A + 手动开关）──
+  // 断开条件（任一满足）：
+  //   a. 节点开关关闭（设置面板"接收上游文本"= 关闭）
+  //   b. 画布上任一「文本(透传)」节点处于 📝 内容 模式
+  // 断开仅在提交序列化瞬间生效，提交后立即原样恢复，画布连线视觉不变。
+  async setup() {
+    if (!app.queuePrompt) return;
+    const origQueuePrompt = app.queuePrompt.bind(app);
+    app.queuePrompt = async function (...args) {
+      const restore = ctnDetachInputLinksIfNeeded();
+      try {
+        return await origQueuePrompt(...args);
+      } finally {
+        restore();
+      }
     };
   },
 });
