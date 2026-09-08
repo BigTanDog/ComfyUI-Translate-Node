@@ -9,14 +9,47 @@ import { api } from "../../scripts/api.js";
 const COMFY_CLASS = "ComfyTranslateNode";
 
 const MODEL_INFO = {
-  deepseek: { label: "DeepSeek-V4-Flash", keyStorage: "ctn_key_deepseek" },
-  glm: { label: "GLM-5.3-Flash", keyStorage: "ctn_key_glm" },
+  deepseek: { label: "DeepSeek-V4-Flash", keyStorage: "ctn_key_deepseek", regUrl: "https://platform.deepseek.com/api_keys" },
+  glm: { label: "GLM-5.3-Flash", keyStorage: "ctn_key_glm", regUrl: "https://open.bigmodel.cn/usercenter/apikeys" },
 };
 
 const NODE_W = 480;    // 节点最小宽（左右双框布局）
 const BOX_MIN_H = 150; // 文本框初始固定高度
 const BOX_MAX_H = 600; // 高度上限，超出后框内滚动
 const HEADER_H = 80;   // 节点标题 + 输入输出接口区高度
+
+// ---------------- API key 混淆存取（XOR+Base64，防误览；非加密）----------------
+const CTN_OBF_PREFIX = "obf1:";
+const CTN_OBF_KEY = "ComfyTranslateNode@local";
+function ctnObf(plain) {
+  const data = new TextEncoder().encode(plain);
+  const k = new TextEncoder().encode(CTN_OBF_KEY);
+  let bin = "";
+  data.forEach((b, i) => { bin += String.fromCharCode(b ^ k[i % k.length]); });
+  return CTN_OBF_PREFIX + btoa(bin);
+}
+function ctnDeobf(stored) {
+  if (!stored.startsWith(CTN_OBF_PREFIX)) return null; // 旧明文（未混淆）
+  const bin = atob(stored.slice(CTN_OBF_PREFIX.length));
+  const k = new TextEncoder().encode(CTN_OBF_KEY);
+  const bytes = new Uint8Array([...bin].map((c, i) => c.charCodeAt(0) ^ k[i % k.length]));
+  return new TextDecoder().decode(bytes);
+}
+function keySave(provider, key) {
+  try { localStorage.setItem(MODEL_INFO[provider].keyStorage, key ? ctnObf(key) : ""); }
+  catch (e) { localStorage.setItem(MODEL_INFO[provider].keyStorage, key); }
+}
+function keyLoad(provider) {
+  const raw = localStorage.getItem(MODEL_INFO[provider].keyStorage) || "";
+  if (!raw) return "";
+  try {
+    const s = ctnDeobf(raw);
+    if (s !== null) return s;
+  } catch (e) {}
+  // 旧明文密钥：读取时自动迁移为混淆存储
+  try { localStorage.setItem(MODEL_INFO[provider].keyStorage, ctnObf(raw)); } catch (e) {}
+  return raw;
+}
 
 // ---------------- 样式注入 ----------------
 (function injectStyle() {
@@ -132,6 +165,16 @@ const HEADER_H = 80;   // 节点标题 + 输入输出接口区高度
   background:var(--comfy-input-bg, #232323); color:var(--input-text, #ddd);
   border:1px solid var(--border-color, #444); border-radius:6px;
 }
+.ctn-keyrow { display:flex; gap:6px; }
+.ctn-keyrow input { flex:1; }
+.ctn-keyrow #ctn-eye {
+  flex:0 0 38px; border:1px solid var(--border-color,#444); border-radius:6px;
+  background:#2c2c2c; color:var(--input-text,#ddd); cursor:pointer; font-size:14px;
+}
+.ctn-keyrow #ctn-eye:hover { background:#3a3a3a; }
+.ctn-getapi { font-size:12px; color:#999; }
+.ctn-getapi a { color:#7ab8ff; text-decoration:none; }
+.ctn-getapi a:hover { text-decoration:underline; }
 .ctn-panel .ctn-row button { flex:1; }
 .ctn-panel .ctn-ok { background:#2d6cdf !important; color:#fff !important; border-color:transparent !important; }
 `;
@@ -162,7 +205,11 @@ function openSettings(node) {
         <button id="ctn-accept" class="${node.properties.ctn_accept_input === false ? "" : "ctn-active"}" style="flex:0 0 60px;">${node.properties.ctn_accept_input === false ? "关闭" : "开启"}</button>
       </div>
       <div class="ctn-line">API 密钥（<span id="ctn-key-label">${MODEL_INFO[selected].label}</span>）：</div>
-      <input id="ctn-key" type="password" placeholder="sk-..." autocomplete="off">
+      <div class="ctn-keyrow">
+        <input id="ctn-key" type="password" placeholder="粘贴 API 密钥…" autocomplete="off">
+        <button id="ctn-eye" type="button" title="显示/隐藏密钥">👁</button>
+      </div>
+      <div id="ctn-getapi" class="ctn-getapi" style="display:none"></div>
       <div class="ctn-row">
         <button id="ctn-ok" class="ctn-ok">确认</button>
         <button id="ctn-cancel">取消</button>
@@ -173,7 +220,21 @@ function openSettings(node) {
   const keyInput = overlay.querySelector("#ctn-key");
   const curLabel = overlay.querySelector("#ctn-cur");
   const keyLabel = overlay.querySelector("#ctn-key-label");
-  keyInput.value = localStorage.getItem(MODEL_INFO[selected].keyStorage) || "";
+  keyInput.value = keyLoad(selected);
+
+  // 密钥为空时显示"前往获取"链接（随模型切换）
+  const getApi = overlay.querySelector("#ctn-getapi");
+  const renderGetApi = () => {
+    const has = !!keyInput.value.trim();
+    getApi.style.display = has ? "none" : "block";
+    getApi.innerHTML = "还没有 API？<a href='" + MODEL_INFO[selected].regUrl + "' target='_blank' rel='noopener'>点此前往获取 →</a>";
+    keyInput.placeholder = selected === "glm" ? "粘贴智谱 API 密钥…" : "粘贴 sk-... 密钥…";
+  };
+  renderGetApi();
+  keyInput.addEventListener("input", renderGetApi);
+  overlay.querySelector("#ctn-eye").addEventListener("click", () => {
+    keyInput.type = keyInput.type === "password" ? "text" : "password";
+  });
 
   // 接收上游文本开关（关闭 = 相当于断开 text 输入接口，queue 时不会拉起上游）
   let acceptInput = node.properties.ctn_accept_input !== false;
@@ -193,22 +254,22 @@ function openSettings(node) {
       );
       curLabel.textContent = MODEL_INFO[selected].label;
       keyLabel.textContent = MODEL_INFO[selected].label;
-      keyInput.value = localStorage.getItem(MODEL_INFO[selected].keyStorage) || "";
+      keyInput.value = keyLoad(selected);
+      renderGetApi();
     });
   });
 
-  const close = () => overlay.remove();
+  const onEsc = (e) => { if (e.key === "Escape") close(); };
+  const close = () => { overlay.remove(); document.removeEventListener("keydown", onEsc); };
   overlay.querySelector("#ctn-cancel").addEventListener("click", close);
   overlay.addEventListener("click", (e) => {
     if (e.target === overlay) close();
   });
-  document.addEventListener("keydown", function esc(e) {
-    if (e.key === "Escape") { close(); document.removeEventListener("keydown", esc); }
-  });
+  document.addEventListener("keydown", onEsc);
 
   // 确认：保存密钥 + 切换模型
   overlay.querySelector("#ctn-ok").addEventListener("click", () => {
-    localStorage.setItem(MODEL_INFO[selected].keyStorage, keyInput.value.trim());
+    keySave(selected, keyInput.value.trim());
     node.properties.translate_model = selected;
     node.properties.ctn_accept_input = acceptInput;
     close();
@@ -307,7 +368,9 @@ function buildUI(node) {
   };
   syncWhenReady();
   // 节点宽度变化时（用户拖拽）重新量高
-  new ResizeObserver(() => sync()).observe(el);
+  const ro = new ResizeObserver(() => sync());
+  ro.observe(el);
+  node.ctn.ro = ro; // 节点删除时 disconnect，防监听泄漏
 
   // 输入/输出内容持久化到节点属性（随工作流保存）
   inputEl.value = node.properties.ctn_input || "";
@@ -358,7 +421,14 @@ function buildUI(node) {
       return;
     }
     const provider = node.properties.translate_model || "deepseek";
-    const apiKey = localStorage.getItem(MODEL_INFO[provider].keyStorage) || "";
+    const apiKey = keyLoad(provider);
+    if (!apiKey) {
+      const info = MODEL_INFO[provider];
+      statusEl.innerHTML = "未填 " + info.label + " 的 API 密钥，<a href='" + info.regUrl +
+        "' target='_blank' rel='noopener'>点此前往获取</a>，或点 ⚙️ 设置填写";
+      statusEl.className = "ctn-status err";
+      return;
+    }
 
     goBtn.disabled = true;
     goBtn.textContent = "翻译中…";
@@ -527,6 +597,15 @@ app.registerExtension({
         console.error("[TranslateNode] UI 构建失败:", e);
         this.title += " ⚠️UI错误";
       }
+      return r;
+    };
+
+    // 节点移除：断开 ResizeObserver，防 DOM 引用泄漏
+    const onRemoved = nodeType.prototype.onRemoved;
+    nodeType.prototype.onRemoved = function () {
+      const r = onRemoved?.apply(this, arguments);
+      this.ctn?.ro?.disconnect();
+      this.ctn = null;
       return r;
     };
 
