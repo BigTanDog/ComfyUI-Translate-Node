@@ -11,7 +11,7 @@ const COMFY_CLASS = "ComfyTranslateNode";
 const MODEL_INFO = {
   deepseek: { label: "DeepSeek-V4-Flash", keyStorage: "ctn_key_deepseek", regUrl: "https://platform.deepseek.com/api_keys" },
   glm: { label: "GLM-5.3-Flash", keyStorage: "ctn_key_glm", regUrl: "https://open.bigmodel.cn/usercenter/apikeys" },
-  local: { label: "本地 Qwen3.5-9B", local: true },
+  local: { label: "本地模型", local: true },
 };
 
 // 本地模型空闲释放设置（秒）：0=每次翻译后立即释放，-1=不自动释放
@@ -237,7 +237,7 @@ function openSettings(node) {
       <div class="ctn-row">
         <button data-m="deepseek" class="${selected === "deepseek" ? "ctn-active" : ""}">DeepSeek-V4-Flash</button>
         <button data-m="glm" class="${selected === "glm" ? "ctn-active" : ""}">GLM-5.3-Flash</button>
-        <button data-m="local" class="${selected === "local" ? "ctn-active" : ""}">本地 Qwen</button>
+        <button data-m="local" class="${selected === "local" ? "ctn-active" : ""}">本地模型</button>
       </div>
       <div class="ctn-line ctn-line-row" style="display:flex; align-items:center; justify-content:space-between;">
         <span>接收上游文本（text 输入）</span>
@@ -317,17 +317,33 @@ function openSettings(node) {
   // 模型列表（读取 models/LLM 目录，排除 mmproj）
   const loadLocalModels = async () => {
     let models = [];
+    let failMsg = "";
     try {
       const r = await api.fetchApi("/ctn/local/models");
-      const d = await r.json();
-      models = d.models || [];
-    } catch (e) { /* 服务未就绪时不阻塞面板 */ }
+      if (!r.ok) {
+        failMsg = "（读取失败 HTTP " + r.status + "）";
+      } else {
+        const d = await r.json();
+        models = d.models || [];
+      }
+    } catch (e) {
+      failMsg = "（无法连接后端）";
+    }
     modelSel.innerHTML = "";
+    if (failMsg) {
+      const o = document.createElement("option");
+      o.value = "";
+      o.textContent = "（模型列表不可用）";
+      modelSel.appendChild(o);
+      modelHint.textContent = "提示：重启 ComfyUI 后刷新页面，此处会列出 models/LLM 下的 .gguf 模型" + failMsg;
+      return;
+    }
     if (!models.length) {
       const o = document.createElement("option");
       o.value = "";
-      o.textContent = "（未找到 .gguf 模型）";
+      o.textContent = "（models/LLM 目录下没有 .gguf 模型）";
       modelSel.appendChild(o);
+      modelHint.textContent = "";
       return;
     }
     models.forEach((m) => {
