@@ -31,6 +31,13 @@ DEFAULT_IDLE_SECONDS = 180      # 空闲 3 分钟自动释放显存
 IDLE_IMMEDIATE = 0              # 0 = 每次翻译后立即释放
 IDLE_NEVER = -1                 # -1 = 不自动释放
 
+MAX_INPUT_CHARS = 6000          # 超长保护（n_ctx=4096 下的安全上限）
+
+# 待翻译文本分隔标记：防止“文本内指令”被模型当作命令执行（如实测的
+# “Start directly with the description.” 会让模型跳过翻译直接编造描述）
+DELIM_OPEN = "<待翻译文本>"
+DELIM_CLOSE = "</待翻译文本>"
+
 WATCHDOG_INTERVAL = 5           # 看门狗轮询间隔（秒）
 
 # ---------------- 状态 ----------------
@@ -79,22 +86,28 @@ def _ensure_gpu_dll_path() -> None:
 
 # ---------------- 提示词 ----------------
 def build_prompt(system_prompt: str, text: str) -> str:
-    """按 Qwen 对话模板手工拼装，并在 assistant 前缀中预填空思考块（关思考）。"""
+    """按 Qwen 对话模板手工拼装：
+    - 待翻译文本用 <待翻译文本>…</待翻译文本> 包裹（防止文本内指令被模型执行）
+    - assistant 前缀预填空思考块（关思考）
+    """
     return (
         f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
-        f"<|im_start|>user\n{text}<|im_end|>\n"
+        f"<|im_start|>user\n{DELIM_OPEN}\n{text}\n{DELIM_CLOSE}<|im_end|>\n"
         f"<|im_start|>assistant\n<think>\n\n</think>\n\n"
     )
 
 
 def clean_output(s: str) -> str:
-    """防御性清理：去掉可能残留的思考标记与首尾空白"""
+    """防御性清理：去掉可能残留的思考标记、分隔标记与首尾空白"""
     if not s:
         return ""
     s = s.strip()
-    for marker in ("</think>", "<think>", "<|im_start|>", "<|im_end|>"):
+    for marker in ("</think>", "<think>", "<|im_start|>", "<|im_end|>", DELIM_OPEN, DELIM_CLOSE):
         while s.startswith(marker):
             s = s[len(marker):].lstrip()
+    for marker in (DELIM_CLOSE, DELIM_OPEN, "<|im_end|>"):
+        if s.endswith(marker):
+            s = s[: -len(marker)].rstrip()
     return s.strip()
 
 
@@ -190,7 +203,7 @@ def translate(
     text: str,
     system_prompt: str,
     idle_seconds=None,
-    max_tokens: int = DEFAULT_MAX_TOKENS,
+    max_tokens: int = None,
 ) -> str:
     """本地模型翻译。idle_seconds 语义：
     >0 空闲该秒数后自动释放；0 翻译完成后立即释放；-1 不自动释放；None 保持当前设置"""
@@ -198,6 +211,13 @@ def translate(
     text = (text or "").strip()
     if not text:
         raise ValueError("请先输入要翻译的内容")
+    if len(text) > MAX_INPUT_CHARS:
+        raise ValueError(
+            f"文本过长（{len(text)} 字符，本地模型上限约 {MAX_INPUT_CHARS} 字符），请分段翻译"
+        )
+    if max_tokens is None:
+        # 输出预算随输入长度自适应（中文译文 token 数通常不超过原文字符数）
+        max_tokens = max(512, min(2048, len(text)))
 
     with _lock:
         if idle_seconds is not None:
