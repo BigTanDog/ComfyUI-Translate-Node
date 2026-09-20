@@ -80,13 +80,23 @@ async def _translate_handler(request: web.Request) -> web.Response:
         try:
             mod = _load_local_llm_module()
             out = await asyncio.to_thread(
-                mod.translate, text, SYSTEM_PROMPT, payload.get("idle_seconds")
+                mod.translate,
+                text,
+                SYSTEM_PROMPT,
+                payload.get("idle_seconds"),
+                None,                          # max_tokens：自适应
+                (payload.get("model") or "").strip() or None,
             )
             return web.json_response({"translated": out})
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            return web.json_response({"error": f"本地模型失败：{e}"})
+            msg = str(e)
+            low = msg.lower()
+            if any(k in low for k in ["out of memory", "failed to allocate",
+                                      "unable to allocate", "outofmemory", "oom"]):
+                msg = f"显存不足（无法加载该模型）：{msg}｜请在设置中换更小的模型，或先释放显存"
+            return web.json_response({"error": f"本地模型失败：{msg}"})
 
     if provider not in PROVIDERS:
         return web.json_response({"error": f"未知模型: {provider}"}, status=400)
@@ -137,12 +147,21 @@ async def _translate_handler(request: web.Request) -> web.Response:
 
 # ---------------- 本地模型管理路由 ----------------
 async def _local_status_handler(request: web.Request) -> web.Response:
-    """本地模型状态：是否已加载 / 空闲倒计时 / 模型路径是否存在"""
+    """本地模型状态：是否已加载 / 空闲倒计时 / 当前模型与大小"""
     try:
         mod = _load_local_llm_module()
         return web.json_response(mod.status())
     except Exception as e:
         return web.json_response({"loaded": False, "error": str(e)})
+
+
+async def _local_models_handler(request: web.Request) -> web.Response:
+    """列出可选的本地 GGUF 模型（models/LLM 目录，排除 mmproj）"""
+    try:
+        mod = _load_local_llm_module()
+        return web.json_response({"models": mod.list_models(), "model_dir": mod.model_dir()})
+    except Exception as e:
+        return web.json_response({"models": [], "error": str(e)})
 
 
 async def _local_unload_handler(request: web.Request) -> web.Response:
@@ -161,6 +180,7 @@ if PromptServer is not None:
     if _ps is not None:
         _ps.routes.post("/ctn/translate")(_translate_handler)
         _ps.routes.get("/ctn/local/status")(_local_status_handler)
+        _ps.routes.get("/ctn/local/models")(_local_models_handler)
         _ps.routes.post("/ctn/local/unload")(_local_unload_handler)
 
 

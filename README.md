@@ -60,16 +60,30 @@ git clone https://github.com/BigTanDog/ComfyUI-Translate-Node.git
 | 长 tags / 段落（热） | 0.8~1.2 秒 |
 | 卸载 → 重载 | 卸载约 1 秒；重载约 3.5 秒 |
 
+### 📦 模型选择
+
+设置面板中的「本地模型」下拉会自动列出 `ComfyUI/models/LLM/` 下的所有 `.gguf`（自动排除 mmproj 视觉投影文件），并标注文件大小（显存占用与文件大小相当，可据此判断能否装下）：
+
+```
+Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf（5.24 GB）
+Qwen3VL-8B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf（4.68 GB）
+Qwen3VL-8B-Uncensored-HauhauCS-Aggressive-Q6_K.gguf（6.26 GB）
+```
+
+- 选择随工作流/浏览器保存；**切换模型时会自动释放旧模型的显存**，下次翻译加载所选模型
+- 未做选择时使用默认模型（`Qwen3.5-9B-…-Q4_K_M.gguf`）；可用环境变量 `CTN_LOCAL_MODEL` / `CTN_LOCAL_MODEL_DIR` 覆盖
+- 状态栏与标题显示简化名（如 `Qwen3.5-9B-Q4_K_M`），便于核对用的哪个模型
+
 ### ⚠️ 注意事项（显存）
 
-本地模型**全 GPU 加载，约占 5.6GB 显存**（RTX 5050 8GB 实测）。因此：
+本地模型为**全 GPU 推理，显存占用与所选模型文件大小相当**（例如 5.24GB 的 Q4_K_M 约需 5.6GB 显存，含计算缓冲）。因此：
 
-- **建议在跑图前或跑图后使用翻译**，避免与出图同时争抢显存
+- **建议在跑图前或跑图后使用翻译**，避免与出图同时争抢显存；若模型过大装不下，状态栏会提示"显存不足"并建议换更小的模型
 - 设置面板中可配置释放策略：
   - 「翻译完成后」：立即释放 / 空闲 1 分钟 / **空闲 3 分钟（默认）** / 空闲 10 分钟 / 不自动释放
   - 「运行工作流前自动释放」（默认开启）：点运行按钮提交队列前自动卸载模型、腾出显存给出图
   - 「立即释放显存」按钮：手动释放
-- 面板状态行实时显示：已加载（含空闲倒计时）/ 未加载 / 加载中
+- 面板状态行实时显示：已加载（模型名 · 显存占用 · 空闲倒计时）/ 未加载 / 加载中
 
 ### 行为与稳健性
 
@@ -84,8 +98,8 @@ git clone https://github.com/BigTanDog/ComfyUI-Translate-Node.git
 ### 环境要求
 
 - `llama-cpp-python`（CUDA 版，随 [ComfyUI-llama-cpp_vllm](https://github.com/) 插件一起安装的 `cu128/cu130` 轮子即可）
-- GGUF 模型放在 `ComfyUI/models/LLM/` 下（默认文件名 `Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf`）
-- 可用环境变量 `CTN_LOCAL_MODEL` 指定其他 `.gguf` 路径
+- GGUF 模型放在 `ComfyUI/models/LLM/` 下，设置面板下拉会自动列出可选择（排除 mmproj 文件）
+- 未选择时使用默认模型 `Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf`；可用环境变量 `CTN_LOCAL_MODEL`（指定文件）/ `CTN_LOCAL_MODEL_DIR`（指定目录）覆盖
 
 ### 实现要点（供开发者参考）
 

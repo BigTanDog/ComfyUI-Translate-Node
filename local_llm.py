@@ -3,7 +3,8 @@
 
 设计要点（均经实测确认）：
 - 懒加载单例：首次翻译时加载（约 3-5 秒），之后常驻显存复用，每次翻译 0.4~1.5 秒
-- 全 GPU：n_gpu_layers=-1，33/33 层进显存，约占 5.6GB
+- 全 GPU：n_gpu_layers=-1（显存占用与所选模型文件大小相当，如 5.2GB 的 Q4_K_M）
+- 可选模型：扫描 `models/LLM/*.gguf`（排除 mmproj），支持翻译时按选择自动切换
 - ctx_checkpoints=0：关闭 hybrid 模型的检查点机制。该机制每次调用会做约 1.6 秒的
   显存→内存状态拷贝（llama.cpp fork 作者注释明确这是为 ComfyUI 单次调用场景预留的开关）
 - 手动 no-think 预填：模型自带 thinking 模式，直接在提示词中预填空的思考块
@@ -22,8 +23,8 @@ import threading
 import time
 
 # ---------------- 配置 ----------------
-MODEL_FILENAME = "Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf"
-_FALLBACK_MODEL = r"D:\ComfyUI-aki-v3.2\ComfyUI\models\LLM" + "\\" + MODEL_FILENAME
+DEFAULT_MODEL_FILENAME = "Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf"
+_FALLBACK_MODEL_DIR = r"D:\ComfyUI-aki-v3.2\ComfyUI\models\LLM"
 
 DEFAULT_N_CTX = 4096
 DEFAULT_MAX_TOKENS = 1024
@@ -50,22 +51,60 @@ _last_error = ""
 _load_count = 0
 _unload_count = 0
 _watchdog_started = False
+_loaded_model = None      # 当前已加载的模型文件名
+_selected_model = None    # 最近一次请求选用的模型文件名（卸载后重载时沿用）
 
 
-# ---------------- 路径解析 ----------------
-def resolve_model_path() -> str:
-    """环境变量 CTN_LOCAL_MODEL > ComfyUI models/LLM/ > 兜底绝对路径"""
-    env = os.environ.get("CTN_LOCAL_MODEL")
-    if env and os.path.isfile(env):
+# ---------------- 模型路径与列表 ----------------
+def model_dir() -> str:
+    """本地模型目录：环境变量 CTN_LOCAL_MODEL_DIR > ComfyUI models/LLM > 兜底路径"""
+    env = os.environ.get("CTN_LOCAL_MODEL_DIR")
+    if env and os.path.isdir(env):
         return env
     try:
         import folder_paths  # ComfyUI 环境内可用
-        p = os.path.join(str(folder_paths.models_dir), "LLM", MODEL_FILENAME)
-        if os.path.isfile(p):
-            return p
+        d = os.path.join(str(folder_paths.models_dir), "LLM")
+        if os.path.isdir(d):
+            return d
     except Exception:
         pass
-    return _FALLBACK_MODEL
+    return _FALLBACK_MODEL_DIR
+
+
+def list_models() -> list:
+    """列出可选的本地 GGUF 模型（排除 mmproj 视觉投影文件）"""
+    d = model_dir()
+    out = []
+    try:
+        for fn in sorted(os.listdir(d)):
+            low = fn.lower()
+            if not low.endswith(".gguf") or "mmproj" in low:
+                continue
+            p = os.path.join(d, fn)
+            if os.path.isfile(p):
+                size = os.path.getsize(p)
+                out.append({
+                    "name": fn,
+                    "size_bytes": size,
+                    "size_gb": round(size / (1024 ** 3), 2),
+                })
+    except Exception:
+        pass
+    return out
+
+
+def resolve_model_path(model_name: str = None) -> str:
+    """解析模型路径：请求指定（模型目录内文件名）> 环境变量 CTN_LOCAL_MODEL > 目录内默认文件名"""
+    d = model_dir()
+    name = (model_name or "").strip()
+    if name:
+        p = name if os.path.isabs(name) else os.path.join(d, name)
+        if os.path.isfile(p):
+            return p
+    env = os.environ.get("CTN_LOCAL_MODEL")
+    if env and os.path.isfile(env):
+        return env
+    return os.path.join(d, DEFAULT_MODEL_FILENAME)
 
 
 def _ensure_gpu_dll_path() -> None:
@@ -135,17 +174,25 @@ def _start_watchdog_locked() -> None:
     threading.Thread(target=loop, name="ctn-local-llm-watchdog", daemon=True).start()
 
 
-def _load_locked():
-    """（须持有锁）确保模型已加载并返回实例"""
-    global _llm, _loading, _last_error, _last_used, _load_count
-    if _llm is not None:
-        return _llm
+def _load_locked(model_name: str = None):
+    """（须持有锁）确保目标模型已加载并返回实例。
+    若当前加载的不是目标模型，先卸载再加载（切换模型）。"""
+    global _llm, _loading, _last_error, _last_used, _load_count, _loaded_model, _selected_model
 
-    path = resolve_model_path()
+    if model_name:
+        _selected_model = os.path.basename(model_name)
+    want = _selected_model or DEFAULT_MODEL_FILENAME
+
+    if _llm is not None:
+        if _loaded_model == want:
+            return _llm
+        _unload_locked("switch_model")  # 切换模型：先释放当前显存
+
+    path = resolve_model_path(want)
     if not os.path.isfile(path):
         raise FileNotFoundError(
             f"未找到本地模型文件：{path}\n"
-            f"（可通过环境变量 CTN_LOCAL_MODEL 指定其他 .gguf 路径）"
+            f"（模型需放在 {model_dir()}，或用环境变量 CTN_LOCAL_MODEL 指定）"
         )
 
     _loading = True
@@ -163,13 +210,15 @@ def _load_locked():
             verbose=False,
         )
         _load_count += 1
+        _loaded_model = os.path.basename(path)
         _last_used = time.time()
         _start_watchdog_locked()
-        print(f"[TranslateNode] 本地模型已加载（{time.time() - t0:.1f}s）：{os.path.basename(path)}")
+        print(f"[TranslateNode] 本地模型已加载（{time.time() - t0:.1f}s）：{_loaded_model}")
         return _llm
     except Exception as e:
         _last_error = str(e)
         _llm = None
+        _loaded_model = None
         raise
     finally:
         _loading = False
@@ -177,7 +226,7 @@ def _load_locked():
 
 def _unload_locked(reason: str = "") -> bool:
     """（须持有锁）卸载模型并释放显存"""
-    global _llm, _unload_count
+    global _llm, _unload_count, _loaded_model
     if _llm is None:
         return False
     try:
@@ -185,6 +234,7 @@ def _unload_locked(reason: str = "") -> bool:
     except Exception:
         pass
     _llm = None
+    _loaded_model = None
     gc.collect()
     _unload_count += 1
     if reason:
@@ -204,9 +254,11 @@ def translate(
     system_prompt: str,
     idle_seconds=None,
     max_tokens: int = None,
+    model: str = None,
 ) -> str:
     """本地模型翻译。idle_seconds 语义：
-    >0 空闲该秒数后自动释放；0 翻译完成后立即释放；-1 不自动释放；None 保持当前设置"""
+    >0 空闲该秒数后自动释放；0 翻译完成后立即释放；-1 不自动释放；None 保持当前设置
+    model：模型目录内的 .gguf 文件名；与当前已加载模型不同则自动切换。"""
     global _last_used, _idle_seconds
     text = (text or "").strip()
     if not text:
@@ -227,7 +279,7 @@ def translate(
             except (TypeError, ValueError):
                 pass
 
-        llm = _load_locked()
+        llm = _load_locked(model)
         prompt = build_prompt(system_prompt, text)
         # 每次翻译前强制清空上下文（注意力 KV + 循环状态）。
         # 该模型为 hybrid 架构：复用上一轮 KV 时，循环状态理论上可能残留旧内容，
@@ -265,17 +317,26 @@ def translate(
 # ---------------- 状态 ----------------
 def status() -> dict:
     with _lock:
-        path = resolve_model_path()
+        path = resolve_model_path(_selected_model)
         loaded = _llm is not None
         remaining = None
         if loaded and _idle_seconds > 0:
             remaining = max(0, int(_idle_seconds - (time.time() - _last_used)))
+        loaded_size = None
+        if loaded and _loaded_model:
+            p = resolve_model_path(_loaded_model)
+            if os.path.isfile(p):
+                loaded_size = round(os.path.getsize(p) / (1024 ** 3), 2)
         return {
             "loaded": loaded,
             "loading": _loading,
             "model": os.path.basename(path),
             "model_path": path,
             "model_exists": os.path.isfile(path),
+            "model_dir": model_dir(),
+            "selected_model": _selected_model or DEFAULT_MODEL_FILENAME,
+            "loaded_model": _loaded_model,
+            "loaded_model_size_gb": loaded_size,
             "device": "GPU (n_gpu_layers=-1)",
             "idle_seconds": _idle_seconds,
             "idle_remaining": remaining,

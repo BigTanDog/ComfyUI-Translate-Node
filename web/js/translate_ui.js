@@ -22,6 +22,18 @@ function localIdleSeconds() {
   return Number.isFinite(n) ? n : 180;
 }
 
+// 本地模型选择（models/LLM 目录内的 .gguf 文件名）
+function localModelName() {
+  return localStorage.getItem("ctn_local_model") || "";
+}
+// 状态栏/标题用的短名称：去掉通用冗余词，保留模型与量化标识
+function shortModelName(name) {
+  let s = (name || "").replace(/\.gguf$/i, "");
+  s = s.replace(/-Uncensored/gi, "").replace(/-HauhauCS/gi, "").replace(/-Aggressive/gi, "");
+  s = s.replace(/-{2,}/g, "-").replace(/^-+|-+$/g, "");
+  return s.length > 32 ? s.slice(0, 31) + "…" : s;
+}
+
 const NODE_W = 480;    // 节点最小宽（左右双框布局）
 const BOX_MIN_H = 150; // 文本框初始固定高度
 const BOX_MAX_H = 600; // 高度上限，超出后框内滚动
@@ -192,6 +204,10 @@ function keyLoad(provider) {
   border-radius:6px; padding:8px 10px;
 }
 .ctn-note b { color:#e8bc63; }
+.ctn-modelrow { display:flex; align-items:center; gap:8px; }
+.ctn-modelrow > span { flex:0 0 auto; }
+.ctn-modelrow select { flex:1; min-width:0; }
+.ctn-modelhint { font-size:11px; line-height:14px; color:#888; min-height:14px; }
 .ctn-localbox select {
   background:var(--comfy-input-bg,#232323); color:var(--input-text,#ddd);
   border:1px solid var(--border-color,#444); border-radius:6px; padding:5px 8px; font-size:12px;
@@ -237,9 +253,14 @@ function openSettings(node) {
       </div>
       <div id="ctn-localbox" class="ctn-localbox" style="display:none">
         <div class="ctn-note">
-          ⚠️ 本地模型<b>全 GPU 加载，约占 5.6GB 显存</b>。请在<b>跑图前或跑图后</b>使用翻译；
-          若需与出图并行，请先点下方「立即释放显存」。
+          ⚠️ 本地模型为<b>全 GPU 推理</b>，显存占用与所选模型文件大小相当。
+          建议在<b>跑图前或跑图后</b>使用翻译；运行工作流前会自动释放显存。
         </div>
+        <div class="ctn-line ctn-modelrow">
+          <span>本地模型</span>
+          <select id="ctn-model" title="选择 models/LLM 目录下的 GGUF 模型"></select>
+        </div>
+        <div id="ctn-modelhint" class="ctn-modelhint"></div>
         <div class="ctn-line" style="display:flex; align-items:center; justify-content:space-between;">
           <span>翻译完成后</span>
           <select id="ctn-idle">
@@ -289,7 +310,58 @@ function openSettings(node) {
 
   // ---- 本地模型设置区 ----
   const lStatus = overlay.querySelector("#ctn-lstatus");
+  const modelSel = overlay.querySelector("#ctn-model");
+  const modelHint = overlay.querySelector("#ctn-modelhint");
   const idleSel = overlay.querySelector("#ctn-idle");
+
+  // 模型列表（读取 models/LLM 目录，排除 mmproj）
+  const loadLocalModels = async () => {
+    let models = [];
+    try {
+      const r = await api.fetchApi("/ctn/local/models");
+      const d = await r.json();
+      models = d.models || [];
+    } catch (e) { /* 服务未就绪时不阻塞面板 */ }
+    modelSel.innerHTML = "";
+    if (!models.length) {
+      const o = document.createElement("option");
+      o.value = "";
+      o.textContent = "（未找到 .gguf 模型）";
+      modelSel.appendChild(o);
+      return;
+    }
+    models.forEach((m) => {
+      const o = document.createElement("option");
+      o.value = m.name;
+      o.textContent = m.name + "（" + m.size_gb + " GB）";
+      modelSel.appendChild(o);
+    });
+    const saved = localModelName();
+    const pick = models.some((m) => m.name === saved) ? saved : models[0].name;
+    modelSel.value = pick;
+    localStorage.setItem("ctn_local_model", pick);
+    if (selected === "local") curLabel.textContent = "本地 · " + shortModelName(pick);
+  };
+
+  // 切换模型：保存选择；若当前加载的是别的模型 → 立即释放显存，下次翻译时加载所选
+  modelSel.addEventListener("change", async () => {
+    localStorage.setItem("ctn_local_model", modelSel.value);
+    if (selected === "local") curLabel.textContent = "本地 · " + shortModelName(modelSel.value);
+    modelHint.textContent = "";
+    try {
+      const st = await (await api.fetchApi("/ctn/local/status")).json();
+      if (st.loaded && st.loaded_model && st.loaded_model !== modelSel.value) {
+        await api.fetchApi("/ctn/local/unload", { method: "POST" });
+        modelHint.textContent = "已释放原模型显存，下次翻译时加载所选模型";
+      } else if (st.loaded) {
+        modelHint.textContent = "所选模型已加载";
+      } else {
+        modelHint.textContent = "下次翻译时加载所选模型（约 4 秒）";
+      }
+    } catch (e) { /* 状态查询失败不影响选择 */ }
+    refreshLocalStatus();
+  });
+
   idleSel.value = String(localIdleSeconds());
   idleSel.addEventListener("change", () => localStorage.setItem("ctn_local_idle", idleSel.value));
   const autoBtn = overlay.querySelector("#ctn-autoqueue");
@@ -313,7 +385,7 @@ function openSettings(node) {
       const r = await api.fetchApi("/ctn/local/status");
       const st = await r.json();
       if (st.error) { lStatus.textContent = "查询失败：" + st.error; return; }
-      if (!st.model_exists) { lStatus.textContent = "未找到模型文件"; return; }
+      if (!st.model_exists) { lStatus.textContent = "未找到所选模型文件"; return; }
       if (st.loading) { lStatus.textContent = "加载中…"; return; }
       if (st.loaded) {
         let tail;
@@ -323,13 +395,19 @@ function openSettings(node) {
           const s = st.idle_remaining ?? 0;
           tail = "，空闲 " + (s >= 60 ? Math.ceil(s / 60) + " 分钟" : s + " 秒") + "后自动释放";
         }
-        lStatus.textContent = "已加载（约 5.6GB 显存" + tail + "）";
+        const name = shortModelName(st.loaded_model || "");
+        const size = st.loaded_model_size_gb ? "约 " + st.loaded_model_size_gb + "GB 显存" : "";
+        lStatus.textContent = "已加载（" + [name, size].filter(Boolean).join(" · ") + tail + "）";
       } else {
         lStatus.textContent = "未加载（下次翻译自动加载，约 4 秒）";
       }
     } catch (e) { lStatus.textContent = "查询失败"; }
   };
-  const startLocalPoll = () => { refreshLocalStatus(); if (!localTimer) localTimer = setInterval(refreshLocalStatus, 2000); };
+  const startLocalPoll = () => {
+    loadLocalModels();
+    refreshLocalStatus();
+    if (!localTimer) localTimer = setInterval(refreshLocalStatus, 2000);
+  };
   overlay.querySelector("#ctn-lrefresh").addEventListener("click", refreshLocalStatus);
   overlay.querySelector("#ctn-release").addEventListener("click", async () => {
     lStatus.textContent = "释放中…";
@@ -350,7 +428,9 @@ function openSettings(node) {
   // 模型区渲染：本地模型时隐藏密钥区、显示本地设置区
   const renderModelUI = () => {
     const isLocal = !!MODEL_INFO[selected].local;
-    curLabel.textContent = MODEL_INFO[selected].label;
+    curLabel.textContent = isLocal
+      ? (localModelName() ? "本地 · " + shortModelName(localModelName()) : "本地模型")
+      : MODEL_INFO[selected].label;
     keyBox.style.display = isLocal ? "none" : "block";
     localBox.style.display = isLocal ? "flex" : "none";
     if (isLocal) {
@@ -588,8 +668,12 @@ function buildUI(node) {
     const t0 = performance.now();
     try {
       const body = { provider, text };
-      if (isLocal) body.idle_seconds = localIdleSeconds();
-      else body.api_key = apiKey;
+      if (isLocal) {
+        body.idle_seconds = localIdleSeconds();
+        body.model = localModelName();  // 空字符串时后端用默认模型
+      } else {
+        body.api_key = apiKey;
+      }
       const resp = await api.fetchApi("/ctn/translate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -606,7 +690,10 @@ function buildUI(node) {
         node.ctn.lastSrc = text;
         const secs = ((performance.now() - t0) / 1000).toFixed(1);
         const info = isLocal ? `${secs}s · ${text.length} 字` : `${text.length} 字`;
-        statusEl.textContent = `✓ ${MODEL_INFO[provider].label}（${info}）`;
+        const label = isLocal
+          ? (shortModelName(localModelName()) || MODEL_INFO[provider].label)
+          : MODEL_INFO[provider].label;
+        statusEl.textContent = `✓ ${label}（${info}）`;
         statusEl.className = "ctn-status ok";
         sync();
         updateSwapState();
