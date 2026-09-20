@@ -51,7 +51,7 @@ git clone https://github.com/BigTanDog/ComfyUI-Translate-Node.git
 
 ## 🖥️ 本地模型（全 GPU）
 
-设置面板选择「本地 Qwen」后，翻译由本机 llama.cpp 完成，不联网、不花钱。实测数据：
+设置面板选择「本地模型」后，翻译由本机 llama.cpp 完成，不联网、不花钱。实测数据：
 
 | 场景 | 耗时 |
 |---|---|
