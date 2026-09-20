@@ -209,13 +209,28 @@ def translate(
 
         llm = _load_locked()
         prompt = build_prompt(system_prompt, text)
-        res = llm.create_completion(
-            prompt=prompt,
-            temperature=0.3,
-            max_tokens=max_tokens,
-            stop=["<|im_end|>", "<|im_start|>"],
-        )
-        out = clean_output(res["choices"][0]["text"])
+        # 每次翻译前强制清空上下文（注意力 KV + 循环状态）。
+        # 该模型为 hybrid 架构：复用上一轮 KV 时，循环状态理论上可能残留旧内容，
+        # 导致译文与当前输入不符。全量重算仅增加约 0.1~0.5 秒，换取结果确定性。
+        try:
+            llm.reset()
+        except Exception:
+            pass
+
+        def _run() -> str:
+            res = llm.create_completion(
+                prompt=prompt,
+                temperature=0.3,
+                max_tokens=max_tokens,
+                stop=["<|im_end|>", "<|im_start|>"],
+            )
+            return clean_output(res["choices"][0]["text"])
+
+        out = _run()
+        # 兜底：长文本被原样返回（未翻译，采样偶发）→ 自动重试一次
+        if out and len(text) > 20 and out.strip() == text.strip():
+            out = _run()
+
         _last_used = time.time()
 
         # 每次翻译后立即释放模式

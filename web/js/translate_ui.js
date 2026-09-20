@@ -146,6 +146,7 @@ function keyLoad(provider) {
 .ctn-status { font-size:11px; min-height:14px; line-height:14px; color:#888; }
 .ctn-status.err { color:#e05656; }
 .ctn-status.ok { color:#4fc06a; }
+.ctn-status.warn { color:#d8a84e; }
 
 /* 设置弹窗 */
 #ctn-overlay {
@@ -428,7 +429,8 @@ function buildUI(node) {
   const clearBtn = el.querySelector(".ctn-clear");
 
   // 挂到节点上，供 onConfigure 加载工作流时回填
-  node.ctn = { inputEl, outputEl, sync: null, updateSwap: null };
+  // lastSrc：产生右侧译文所对应的输入文本（null = 未知，如刚加载工作流）
+  node.ctn = { inputEl, outputEl, sync: null, updateSwap: null, updateHint: null, lastSrc: null };
 
   // 关键：新版 Vue 前端要求 type 非空字符串（shouldRenderAsVue: !!widget.type），
   // 传空字符串会导致整个 widget 不被渲染
@@ -475,6 +477,29 @@ function buildUI(node) {
   };
   node.ctn.updateSwap = updateSwapState;
 
+  // 输入已修改但未重新翻译时，明确提示"右侧是上一次的译文"
+  // （翻译进行中修改输入、翻完直接改内容等场景，避免误以为翻译没更新）
+  let hintShown = false;
+  let translating = false;
+  const updateStaleHint = () => {
+    if (translating) return; // 请求进行中状态栏显示进度，不打扰
+    const cur = inputEl.value.trim();
+    const need =
+      node.ctn.lastSrc !== null && !!cur && cur !== node.ctn.lastSrc && !!outputEl.value.trim();
+    if (need) {
+      if (hintShown) return;
+      if (statusEl.className.includes("err")) return; // 不覆盖错误提示
+      statusEl.textContent = "✎ 已修改输入，右侧是上一次的译文 —— 点「翻译」更新";
+      statusEl.className = "ctn-status warn";
+      hintShown = true;
+    } else if (hintShown) {
+      statusEl.textContent = "";
+      statusEl.className = "ctn-status";
+      hintShown = false;
+    }
+  };
+  node.ctn.updateHint = updateStaleHint;
+
   // 元素被 Vue 挂载后再做首次同步（挂载前 scrollHeight 量不到内容）
   let tries = 0;
   const syncWhenReady = () => {
@@ -490,7 +515,7 @@ function buildUI(node) {
   // 输入/输出内容持久化到节点属性（随工作流保存）
   inputEl.value = node.properties.ctn_input || "";
   outputEl.value = node.properties.ctn_output || "";
-  inputEl.addEventListener("input", () => { node.properties.ctn_input = inputEl.value; sync(); });
+  inputEl.addEventListener("input", () => { node.properties.ctn_input = inputEl.value; sync(); updateStaleHint(); });
   outputEl.addEventListener("input", () => { node.properties.ctn_output = outputEl.value; sync(); updateSwapState(); });
   updateSwapState();
 
@@ -502,6 +527,9 @@ function buildUI(node) {
     outputEl.value = inV;
     node.properties.ctn_input = inputEl.value;
     node.properties.ctn_output = outputEl.value;
+    // 互换后左右内容整体换位：以当前输入为基准，避免误报"输入已修改"
+    node.ctn.lastSrc = inputEl.value.trim() || null;
+    hintShown = false;
     statusEl.textContent = "";
     statusEl.className = "ctn-status";
     sync();
@@ -551,6 +579,8 @@ function buildUI(node) {
 
     goBtn.disabled = true;
     goBtn.textContent = "翻译中…";
+    translating = true;
+    hintShown = false;
     if (isLocal) {
       statusEl.textContent = "本地模型加载/推理中…";
       statusEl.className = "ctn-status";
@@ -572,8 +602,11 @@ function buildUI(node) {
       } else {
         outputEl.value = data.translated;
         node.properties.ctn_output = data.translated;
+        // 记录本次译文对应的输入，供"输入已修改"提示比对
+        node.ctn.lastSrc = text;
         const secs = ((performance.now() - t0) / 1000).toFixed(1);
-        statusEl.textContent = `✓ ${MODEL_INFO[provider].label}` + (isLocal ? `（${secs}s）` : "");
+        const info = isLocal ? `${secs}s · ${text.length} 字` : `${text.length} 字`;
+        statusEl.textContent = `✓ ${MODEL_INFO[provider].label}（${info}）`;
         statusEl.className = "ctn-status ok";
         sync();
         updateSwapState();
@@ -584,6 +617,9 @@ function buildUI(node) {
     } finally {
       goBtn.disabled = false;
       goBtn.textContent = "翻译";
+      translating = false;
+      // 请求期间输入被改动过 → 提示右侧译文对应的是上一版输入
+      updateStaleHint();
     }
   });
 
@@ -758,6 +794,8 @@ app.registerExtension({
         this.properties.ctn_input = t;
         this.ctn.sync?.();
         this.ctn.updateSwap?.();
+        // 上游推入新文本后，右侧若还是旧译文 → 立即提示
+        this.ctn.updateHint?.();
       }
       return r;
     };
@@ -770,9 +808,11 @@ app.registerExtension({
       if (ui) {
         ui.inputEl.value = this.properties.ctn_input || "";
         ui.outputEl.value = this.properties.ctn_output || "";
+        ui.lastSrc = null; // 已保存工作流中译文对应的输入未知，不误报提示
         // 挂载可能尚未完成，走 sync 内部的就绪检测
         ui.sync?.();
         ui.updateSwap?.();
+        ui.updateHint?.();
       }
       return r;
     };
