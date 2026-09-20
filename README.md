@@ -8,6 +8,9 @@
 |---|---|---|---|
 | DeepSeek-V4-Flash | [DeepSeek 开放平台](https://platform.deepseek.com/api_keys) | `https://api.deepseek.com` | `deepseek-v4-flash` |
 | GLM-5.3-Flash | [智谱 BigModel](https://open.bigmodel.cn) | `https://open.bigmodel.cn/api/paas/v4` | `glm-5.3-flash` |
+| **本地 Qwen3.5-9B**（GGUF） | 本机 llama.cpp 全 GPU 推理 | 本地 `models/LLM/*.gguf` | `Qwen3.5-9B-Uncensored-...-Q4_K_M.gguf` |
+
+> 本地模型离线可用、无网络延迟、零 API 费用，实测每句翻译 **0.4~1.2 秒**；显存占用与释放策略见下方「本地模型」章节。
 
 ## ✨ 功能特性
 
@@ -18,7 +21,8 @@
 - **发送到透传节点**：➤ 一键把译文发送到 [ComfyUI-Danbooru-Anima-Prompt](https://github.com/) 的「文本（透传）」节点——**自动保留其提示词段**，仅替换内容段；多个透传节点时弹窗选择
 - **复制译文**：一键复制到剪贴板（文本框本身也支持框选复制粘贴）
 - **一键清空**：左框右下角红色 ✕，有内容时出现、点击清空
-- **模型切换**：点 ⚙️ 打开设置面板，顶部实时显示当前模型，DS / GLM 一键切换，API 密钥按模型分开保存
+- **模型切换**：点 ⚙️ 打开设置面板，顶部实时显示当前模型，DS / GLM / 本地 Qwen 一键切换，API 密钥按模型分开保存
+- **本地模型翻译**：可选本机 GGUF 模型（llama.cpp 全 GPU），离线、免费、热调用 0.4~1.2 秒/句；支持空闲自动释放显存 / 每次翻译后立即释放 / 运行工作流前自动释放
 - **新手引导**：密钥未填写时设置面板自动显示"前往获取"链接（直达对应平台注册页）；点翻译时未填密钥也会在状态栏给出获取链接
 - **密钥显隐**：密钥输入框旁 👁 按钮切换显示/隐藏
 - **接口联动**：左侧 `text` 输入接口可接入上游节点（如 WD14 Tagger 等本地反推插件），执行队列后文本自动落入待翻译框
@@ -39,11 +43,46 @@ git clone https://github.com/BigTanDog/ComfyUI-Translate-Node.git
 
 1. 添加「AI 翻译 🌐」节点
 2. 点节点上的 **⚙️** 按钮：
-   - 选择模型（DS / GLM）
+   - 选择模型（DS / GLM / 本地 Qwen）
    - 还没有 API？密钥框下方有直达注册页的链接
-   - 填入对应平台的 API 密钥 → 点「确认」
+   - 填入对应平台的 API 密钥 → 点「确认」（本地模型无需密钥）
 3. 在左侧框粘贴文本，点 **翻译** → 译文出现在右侧框
 4. 需要「拿译文当新原文」时点 **⇅ 互换**
+
+## 🖥️ 本地模型（全 GPU）
+
+设置面板选择「本地 Qwen」后，翻译由本机 llama.cpp 完成，不联网、不花钱。实测数据：
+
+| 场景 | 耗时 |
+|---|---|
+| 首次翻译（含加载模型） | 约 3.5~4 秒（一次性） |
+| 短句翻译（热） | **0.4~0.6 秒** |
+| 长 tags / 段落（热） | 0.8~1.2 秒 |
+| 卸载 → 重载 | 卸载约 1 秒；重载约 3.5 秒 |
+
+### ⚠️ 注意事项（显存）
+
+本地模型**全 GPU 加载，约占 5.6GB 显存**（RTX 5050 8GB 实测）。因此：
+
+- **建议在跑图前或跑图后使用翻译**，避免与出图同时争抢显存
+- 设置面板中可配置释放策略：
+  - 「翻译完成后」：立即释放 / 空闲 1 分钟 / **空闲 3 分钟（默认）** / 空闲 10 分钟 / 不自动释放
+  - 「运行工作流前自动释放」（默认开启）：点运行按钮提交队列前自动卸载模型、腾出显存给出图
+  - 「立即释放显存」按钮：手动释放
+- 面板状态行实时显示：已加载（含空闲倒计时）/ 未加载 / 加载中
+
+### 环境要求
+
+- `llama-cpp-python`（CUDA 版，随 [ComfyUI-llama-cpp_vllm](https://github.com/) 插件一起安装的 `cu128/cu130` 轮子即可）
+- GGUF 模型放在 `ComfyUI/models/LLM/` 下（默认文件名 `Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf`）
+- 可用环境变量 `CTN_LOCAL_MODEL` 指定其他 `.gguf` 路径
+
+### 实现要点（供开发者参考）
+
+- **全 GPU**：`n_gpu_layers=-1`（实测 33/33 层进显存）
+- **关闭 hybrid 检查点**：`ctx_checkpoints=0`。该模型为 hybrid 架构，默认每次调用会做约 1.6 秒的显存↔内存状态拷贝；关闭后单次调用从 ~2.4 秒降到 ~0.5 秒
+- **跳过思考**：模型自带 thinking 模式，提示词中预填空思考块 `<think></think>`，直接输出译文（比 `reasoning_budget` 方案输出更干净）
+- **CUDA 依赖**：`ggml-cuda.dll` 需要 CUDA 运行库（`cudart64_13.dll` 等）——ComfyUI 进程已导入 torch，其 `torch/lib` 目录天然满足；模块内也做了兜底注册
 
 ## 🔌 接入上游节点（如本地反推）
 
@@ -86,12 +125,13 @@ masterpiece, best quality, score_9, ...     ← 第 1 行：提示词，永远�
 ## 🏗️ 工作原理
 
 ```
-[前端 UI] --POST /ctn/translate--> [ComfyUI 后端路由] --> DeepSeek / GLM API
-    ↑                                                        |
+[前端 UI] --POST /ctn/translate--> [ComfyUI 后端路由] --┬--> DeepSeek / GLM API（云端）
+    ↑                                                   └--> 本地 llama.cpp（GGUF · 全 GPU）
     └────────────── 译文 JSON 返回，写入右侧文本框 <──────────┘
 ```
 
 - 翻译请求由**后端路由转发**调用 AI API，无浏览器 CORS 问题
+- 本地模型为**进程内懒加载单例**：首次使用时加载（约 3.5 秒），之后常驻显存复用；空闲看门狗按设定时长自动卸载并释放显存
 - API 密钥保存在浏览器 `localStorage`（按模型分开，混淆存储防误览），随请求传给后端转发，**不落盘、不进日志、不进 URL**
 - 每个节点的模型选择存在节点 `properties` 中，可同屏放多个节点使用不同模型
 - 语言方向识别交给 AI 完成（system prompt 约定），无需本地判断
@@ -118,7 +158,8 @@ masterpiece, best quality, score_9, ...     ← 第 1 行：提示词，永远�
 ```
 ComfyUI-Translate-Node/
 ├── __init__.py          # 插件入口：注册节点 + web 目录
-├── translator_node.py   # 节点定义（OUTPUT_NODE）+ /ctn/translate 翻译路由
+├── translator_node.py   # 节点定义（OUTPUT_NODE）+ /ctn/translate 等 HTTP 路由
+├── local_llm.py         # 本地 GGUF 推理后端（懒加载单例 / 空闲自动卸载 / 显存管理）
 └── web/js/
     └── translate_ui.js  # 前端界面：双栏文本框 / 翻译 / 互换 / 设置弹窗
 ```
@@ -127,6 +168,7 @@ ComfyUI-Translate-Node/
 
 - 翻译按钮为实时 HTTP 请求，不经过 ComfyUI 队列排队；输出接口暂为直通占位
 - 上游文本需执行队列后才会回填（ComfyUI 机制），实时取值暂不支持
+- 本地模型为**全 GPU 模式**（不支持部分层 offload / CPU 模式）：若空闲显存不足 5.6GB（如 ComfyUI 已加载大模型），加载会失败并在状态栏提示——先释放显存或稍后再试
 
 ## 📄 License
 

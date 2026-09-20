@@ -1,4 +1,9 @@
-"""AI 翻译节点：后端节点 + 翻译 HTTP 路由（DeepSeek-V4-Flash / GLM-5.3-Flash）"""
+"""AI 翻译节点：后端节点 + 翻译 HTTP 路由（DeepSeek-V4-Flash / GLM-5.3-Flash / 本地 Qwen GGUF）"""
+
+import asyncio
+import importlib.util
+import os
+import sys
 
 import aiohttp
 from aiohttp import web
@@ -30,6 +35,23 @@ SYSTEM_PROMPT = (
 
 REQUEST_TIMEOUT = 120  # 秒
 
+LOCAL_PROVIDER = "local"  # 本地 Qwen GGUF（llama.cpp 全 GPU）
+
+
+# ---------------- 本地模型模块加载 ----------------
+def _load_local_llm_module():
+    """按文件路径加载同目录的 local_llm.py（避免与其它插件重名冲突）。
+    模块本身不依赖 ComfyUI，llama_cpp 在首次加载模型时才导入。"""
+    name = "ctn_local_llm"
+    if name in sys.modules:
+        return sys.modules[name]
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "local_llm.py")
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
 
 # ---------------- 翻译路由 ----------------
 async def _translate_handler(request: web.Request) -> web.Response:
@@ -41,6 +63,21 @@ async def _translate_handler(request: web.Request) -> web.Response:
     provider = (payload.get("provider") or "deepseek").strip()
     api_key = (payload.get("api_key") or "").strip()
     text = (payload.get("text") or "").strip()
+
+    # ---- 本地模型分支（无需 API 密钥）----
+    if provider == LOCAL_PROVIDER:
+        if not text:
+            return web.json_response({"error": "请先输入要翻译的内容"})
+        try:
+            mod = _load_local_llm_module()
+            out = await asyncio.to_thread(
+                mod.translate, text, SYSTEM_PROMPT, payload.get("idle_seconds")
+            )
+            return web.json_response({"translated": out})
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            return web.json_response({"error": f"本地模型失败：{e}"})
 
     if provider not in PROVIDERS:
         return web.json_response({"error": f"未知模型: {provider}"}, status=400)
@@ -88,11 +125,33 @@ async def _translate_handler(request: web.Request) -> web.Response:
         return web.json_response({"error": f"翻译失败: {e}"})
 
 
+# ---------------- 本地模型管理路由 ----------------
+async def _local_status_handler(request: web.Request) -> web.Response:
+    """本地模型状态：是否已加载 / 空闲倒计时 / 模型路径是否存在"""
+    try:
+        mod = _load_local_llm_module()
+        return web.json_response(mod.status())
+    except Exception as e:
+        return web.json_response({"loaded": False, "error": str(e)})
+
+
+async def _local_unload_handler(request: web.Request) -> web.Response:
+    """手动卸载本地模型，立即释放显存"""
+    try:
+        mod = _load_local_llm_module()
+        freed = await asyncio.to_thread(mod.unload, "manual")
+        return web.json_response({"ok": True, "unloaded": bool(freed)})
+    except Exception as e:
+        return web.json_response({"ok": False, "error": str(e)})
+
+
 # 注册路由（模块导入时执行一次）
 if PromptServer is not None:
     _ps = PromptServer.instance
     if _ps is not None:
         _ps.routes.post("/ctn/translate")(_translate_handler)
+        _ps.routes.get("/ctn/local/status")(_local_status_handler)
+        _ps.routes.post("/ctn/local/unload")(_local_unload_handler)
 
 
 # ---------------- 透传节点模式探测 ----------------

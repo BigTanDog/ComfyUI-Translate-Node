@@ -11,7 +11,16 @@ const COMFY_CLASS = "ComfyTranslateNode";
 const MODEL_INFO = {
   deepseek: { label: "DeepSeek-V4-Flash", keyStorage: "ctn_key_deepseek", regUrl: "https://platform.deepseek.com/api_keys" },
   glm: { label: "GLM-5.3-Flash", keyStorage: "ctn_key_glm", regUrl: "https://open.bigmodel.cn/usercenter/apikeys" },
+  local: { label: "本地 Qwen3.5-9B", local: true },
 };
+
+// 本地模型空闲释放设置（秒）：0=每次翻译后立即释放，-1=不自动释放
+function localIdleSeconds() {
+  const v = localStorage.getItem("ctn_local_idle");
+  if (v === null) return 180;
+  const n = parseInt(v, 10);
+  return Number.isFinite(n) ? n : 180;
+}
 
 const NODE_W = 480;    // 节点最小宽（左右双框布局）
 const BOX_MIN_H = 150; // 文本框初始固定高度
@@ -175,6 +184,18 @@ function keyLoad(provider) {
 .ctn-getapi { font-size:12px; color:#999; }
 .ctn-getapi a { color:#7ab8ff; text-decoration:none; }
 .ctn-getapi a:hover { text-decoration:underline; }
+.ctn-localbox { display:flex; flex-direction:column; gap:8px; }
+.ctn-note {
+  font-size:12px; line-height:1.55; color:#d8a84e;
+  background:rgba(216,168,78,.08); border:1px solid rgba(216,168,78,.35);
+  border-radius:6px; padding:8px 10px;
+}
+.ctn-note b { color:#e8bc63; }
+.ctn-localbox select {
+  background:var(--comfy-input-bg,#232323); color:var(--input-text,#ddd);
+  border:1px solid var(--border-color,#444); border-radius:6px; padding:5px 8px; font-size:12px;
+}
+.ctn-lstatus { color:#7ab8ff; font-size:12px; }
 .ctn-panel .ctn-row button { flex:1; }
 .ctn-panel .ctn-ok { background:#2d6cdf !important; color:#fff !important; border-color:transparent !important; }
 `;
@@ -199,17 +220,45 @@ function openSettings(node) {
       <div class="ctn-row">
         <button data-m="deepseek" class="${selected === "deepseek" ? "ctn-active" : ""}">DeepSeek-V4-Flash</button>
         <button data-m="glm" class="${selected === "glm" ? "ctn-active" : ""}">GLM-5.3-Flash</button>
+        <button data-m="local" class="${selected === "local" ? "ctn-active" : ""}">本地 Qwen</button>
       </div>
       <div class="ctn-line ctn-line-row" style="display:flex; align-items:center; justify-content:space-between;">
         <span>接收上游文本（text 输入）</span>
         <button id="ctn-accept" class="${node.properties.ctn_accept_input === false ? "" : "ctn-active"}" style="flex:0 0 60px;">${node.properties.ctn_accept_input === false ? "关闭" : "开启"}</button>
       </div>
-      <div class="ctn-line">API 密钥（<span id="ctn-key-label">${MODEL_INFO[selected].label}</span>）：</div>
-      <div class="ctn-keyrow">
-        <input id="ctn-key" type="password" placeholder="粘贴 API 密钥…" autocomplete="off">
-        <button id="ctn-eye" type="button" title="显示/隐藏密钥">👁</button>
+      <div id="ctn-keybox">
+        <div class="ctn-line">API 密钥（<span id="ctn-key-label">${MODEL_INFO[selected].label}</span>）：</div>
+        <div class="ctn-keyrow">
+          <input id="ctn-key" type="password" placeholder="粘贴 API 密钥…" autocomplete="off">
+          <button id="ctn-eye" type="button" title="显示/隐藏密钥">👁</button>
+        </div>
+        <div id="ctn-getapi" class="ctn-getapi" style="display:none"></div>
       </div>
-      <div id="ctn-getapi" class="ctn-getapi" style="display:none"></div>
+      <div id="ctn-localbox" class="ctn-localbox" style="display:none">
+        <div class="ctn-note">
+          ⚠️ 本地模型<b>全 GPU 加载，约占 5.6GB 显存</b>。请在<b>跑图前或跑图后</b>使用翻译；
+          若需与出图并行，请先点下方「立即释放显存」。
+        </div>
+        <div class="ctn-line" style="display:flex; align-items:center; justify-content:space-between;">
+          <span>翻译完成后</span>
+          <select id="ctn-idle">
+            <option value="0">立即释放显存</option>
+            <option value="60">空闲 1 分钟释放</option>
+            <option value="180">空闲 3 分钟释放</option>
+            <option value="600">空闲 10 分钟释放</option>
+            <option value="-1">不自动释放</option>
+          </select>
+        </div>
+        <div class="ctn-line" style="display:flex; align-items:center; justify-content:space-between;">
+          <span>运行工作流前自动释放</span>
+          <button id="ctn-autoqueue" style="flex:0 0 60px;">开启</button>
+        </div>
+        <div class="ctn-line">状态：<span class="ctn-lstatus" id="ctn-lstatus">查询中…</span></div>
+        <div class="ctn-row">
+          <button id="ctn-release">立即释放显存</button>
+          <button id="ctn-lrefresh">刷新状态</button>
+        </div>
+      </div>
       <div class="ctn-row">
         <button id="ctn-ok" class="ctn-ok">确认</button>
         <button id="ctn-cancel">取消</button>
@@ -220,20 +269,71 @@ function openSettings(node) {
   const keyInput = overlay.querySelector("#ctn-key");
   const curLabel = overlay.querySelector("#ctn-cur");
   const keyLabel = overlay.querySelector("#ctn-key-label");
-  keyInput.value = keyLoad(selected);
+  const keyBox = overlay.querySelector("#ctn-keybox");
+  const localBox = overlay.querySelector("#ctn-localbox");
 
   // 密钥为空时显示"前往获取"链接（随模型切换）
   const getApi = overlay.querySelector("#ctn-getapi");
   const renderGetApi = () => {
+    if (MODEL_INFO[selected].local) return;
     const has = !!keyInput.value.trim();
     getApi.style.display = has ? "none" : "block";
     getApi.innerHTML = "还没有 API？<a href='" + MODEL_INFO[selected].regUrl + "' target='_blank' rel='noopener'>点此前往获取 →</a>";
     keyInput.placeholder = selected === "glm" ? "粘贴智谱 API 密钥…" : "粘贴 sk-... 密钥…";
   };
-  renderGetApi();
   keyInput.addEventListener("input", renderGetApi);
   overlay.querySelector("#ctn-eye").addEventListener("click", () => {
     keyInput.type = keyInput.type === "password" ? "text" : "password";
+  });
+
+  // ---- 本地模型设置区 ----
+  const lStatus = overlay.querySelector("#ctn-lstatus");
+  const idleSel = overlay.querySelector("#ctn-idle");
+  idleSel.value = String(localIdleSeconds());
+  idleSel.addEventListener("change", () => localStorage.setItem("ctn_local_idle", idleSel.value));
+  const autoBtn = overlay.querySelector("#ctn-autoqueue");
+  const renderAuto = () => {
+    const on = localStorage.getItem("ctn_auto_release_queue") !== "0";
+    autoBtn.textContent = on ? "开启" : "关闭";
+    autoBtn.classList.toggle("ctn-active", on);
+  };
+  autoBtn.addEventListener("click", () => {
+    const on = localStorage.getItem("ctn_auto_release_queue") !== "0";
+    localStorage.setItem("ctn_auto_release_queue", on ? "0" : "1");
+    renderAuto();
+  });
+  renderAuto();
+
+  let localTimer = null;
+  const stopLocalPoll = () => { if (localTimer) { clearInterval(localTimer); localTimer = null; } };
+  const refreshLocalStatus = async () => {
+    if (selected !== "local") return;
+    try {
+      const r = await api.fetchApi("/ctn/local/status");
+      const st = await r.json();
+      if (st.error) { lStatus.textContent = "查询失败：" + st.error; return; }
+      if (!st.model_exists) { lStatus.textContent = "未找到模型文件"; return; }
+      if (st.loading) { lStatus.textContent = "加载中…"; return; }
+      if (st.loaded) {
+        let tail;
+        if (st.idle_seconds === 0) tail = "，每次翻译后自动释放";
+        else if (st.idle_seconds < 0) tail = "，不自动释放";
+        else {
+          const s = st.idle_remaining ?? 0;
+          tail = "，空闲 " + (s >= 60 ? Math.ceil(s / 60) + " 分钟" : s + " 秒") + "后自动释放";
+        }
+        lStatus.textContent = "已加载（约 5.6GB 显存" + tail + "）";
+      } else {
+        lStatus.textContent = "未加载（下次翻译自动加载，约 4 秒）";
+      }
+    } catch (e) { lStatus.textContent = "查询失败"; }
+  };
+  const startLocalPoll = () => { refreshLocalStatus(); if (!localTimer) localTimer = setInterval(refreshLocalStatus, 2000); };
+  overlay.querySelector("#ctn-lrefresh").addEventListener("click", refreshLocalStatus);
+  overlay.querySelector("#ctn-release").addEventListener("click", async () => {
+    lStatus.textContent = "释放中…";
+    try { await api.fetchApi("/ctn/local/unload", { method: "POST" }); } catch (e) {}
+    refreshLocalStatus();
   });
 
   // 接收上游文本开关（关闭 = 相当于断开 text 输入接口，queue 时不会拉起上游）
@@ -244,6 +344,23 @@ function openSettings(node) {
     acceptBtn.classList.toggle("ctn-active", acceptInput);
   };
   acceptBtn.addEventListener("click", () => { acceptInput = !acceptInput; renderAccept(); });
+  renderAccept();
+
+  // 模型区渲染：本地模型时隐藏密钥区、显示本地设置区
+  const renderModelUI = () => {
+    const isLocal = !!MODEL_INFO[selected].local;
+    curLabel.textContent = MODEL_INFO[selected].label;
+    keyBox.style.display = isLocal ? "none" : "block";
+    localBox.style.display = isLocal ? "flex" : "none";
+    if (isLocal) {
+      startLocalPoll();
+    } else {
+      stopLocalPoll();
+      keyLabel.textContent = MODEL_INFO[selected].label;
+      keyInput.value = keyLoad(selected);
+      renderGetApi();
+    }
+  };
 
   // 切换模型：高亮 + 同步显示对应模型的已存密钥
   overlay.querySelectorAll("button[data-m]").forEach((btn) => {
@@ -252,15 +369,13 @@ function openSettings(node) {
       overlay.querySelectorAll("button[data-m]").forEach((b) =>
         b.classList.toggle("ctn-active", b === btn)
       );
-      curLabel.textContent = MODEL_INFO[selected].label;
-      keyLabel.textContent = MODEL_INFO[selected].label;
-      keyInput.value = keyLoad(selected);
-      renderGetApi();
+      renderModelUI();
     });
   });
+  renderModelUI();
 
   const onEsc = (e) => { if (e.key === "Escape") close(); };
-  const close = () => { overlay.remove(); document.removeEventListener("keydown", onEsc); };
+  const close = () => { overlay.remove(); stopLocalPoll(); document.removeEventListener("keydown", onEsc); };
   overlay.querySelector("#ctn-cancel").addEventListener("click", close);
   overlay.addEventListener("click", (e) => {
     if (e.target === overlay) close();
@@ -269,7 +384,7 @@ function openSettings(node) {
 
   // 确认：保存密钥 + 切换模型
   overlay.querySelector("#ctn-ok").addEventListener("click", () => {
-    keySave(selected, keyInput.value.trim());
+    if (!MODEL_INFO[selected].local) keySave(selected, keyInput.value.trim());
     node.properties.translate_model = selected;
     node.properties.ctn_accept_input = acceptInput;
     close();
@@ -421,22 +536,34 @@ function buildUI(node) {
       return;
     }
     const provider = node.properties.translate_model || "deepseek";
-    const apiKey = keyLoad(provider);
-    if (!apiKey) {
-      const info = MODEL_INFO[provider];
-      statusEl.innerHTML = "未填 " + info.label + " 的 API 密钥，<a href='" + info.regUrl +
-        "' target='_blank' rel='noopener'>点此前往获取</a>，或点 ⚙️ 设置填写";
-      statusEl.className = "ctn-status err";
-      return;
+    const isLocal = provider === "local";
+    let apiKey = "";
+    if (!isLocal) {
+      apiKey = keyLoad(provider);
+      if (!apiKey) {
+        const info = MODEL_INFO[provider];
+        statusEl.innerHTML = "未填 " + info.label + " 的 API 密钥，<a href='" + info.regUrl +
+          "' target='_blank' rel='noopener'>点此前往获取</a>，或点 ⚙️ 设置填写";
+        statusEl.className = "ctn-status err";
+        return;
+      }
     }
 
     goBtn.disabled = true;
     goBtn.textContent = "翻译中…";
+    if (isLocal) {
+      statusEl.textContent = "本地模型加载/推理中…";
+      statusEl.className = "ctn-status";
+    }
+    const t0 = performance.now();
     try {
+      const body = { provider, text };
+      if (isLocal) body.idle_seconds = localIdleSeconds();
+      else body.api_key = apiKey;
       const resp = await api.fetchApi("/ctn/translate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ provider, api_key: apiKey, text }),
+        body: JSON.stringify(body),
       });
       const data = await resp.json();
       if (data.error) {
@@ -445,7 +572,8 @@ function buildUI(node) {
       } else {
         outputEl.value = data.translated;
         node.properties.ctn_output = data.translated;
-        statusEl.textContent = `✓ ${MODEL_INFO[provider].label}`;
+        const secs = ((performance.now() - t0) / 1000).toFixed(1);
+        statusEl.textContent = `✓ ${MODEL_INFO[provider].label}` + (isLocal ? `（${secs}s）` : "");
         statusEl.className = "ctn-status ok";
         sync();
         updateSwapState();
@@ -580,6 +708,16 @@ function ctnDetachInputLinksIfNeeded() {
   }
 }
 
+// ---------------- queue 前释放本地模型显存 ----------------
+// 本地模型全 GPU 加载约占 5.6GB 显存；提交工作流前主动释放，避免与出图争抢显存。
+// 可在设置面板关闭该行为（ctn_auto_release_queue = "0"）。未加载时该请求为空操作。
+async function ctnReleaseLocalModelIfNeeded() {
+  try {
+    if (localStorage.getItem("ctn_auto_release_queue") === "0") return;
+    await api.fetchApi("/ctn/local/unload", { method: "POST" });
+  } catch (e) { /* 释放失败不阻断队列提交 */ }
+}
+
 // ---------------- 扩展注册 ----------------
 app.registerExtension({
   name: "ComfyUI.TranslateNode",
@@ -651,6 +789,8 @@ app.registerExtension({
     app.queuePrompt = async function (...args) {
       const restore = ctnDetachInputLinksIfNeeded();
       try {
+        // 本地模型已加载时先释放显存，再提交工作流（可在设置中关闭）
+        await ctnReleaseLocalModelIfNeeded();
         return await origQueuePrompt(...args);
       } finally {
         restore();
